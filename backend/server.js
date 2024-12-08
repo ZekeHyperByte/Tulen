@@ -57,7 +57,7 @@ const calculateMatchScore = (teacher, student) => {
   return Math.min(100, Math.round(finalScore));
 };
 
-// Auth routes
+// Register routes
 app.post('/api/register', async (req, res) => {
   try {
     const { 
@@ -109,6 +109,7 @@ app.get('/api/skills', async (req, res) => {
   }
 });
 
+//Login routes
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -155,7 +156,6 @@ app.put('/api/user/profile', async (req, res) => {
 });
 
 // Bubbles and Skills routes
-// In server.js
 app.get('/api/bubbles', async (req, res) => {
   try {
     const token = req.headers.authorization.split(' ')[1];
@@ -228,6 +228,79 @@ app.get('/api/bubbles/:id/requests', async (req, res) => {
   }
 });
 
+// Join bubble
+app.post('/api/bubbles/:id/join', async (req, res) => {
+  try {
+    const token = req.headers.authorization.split(' ')[1];
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    await pool.query('BEGIN');
+    
+    // Update user's current bubble
+    await pool.query(
+      'UPDATE users SET current_bubble_id = $1 WHERE user_id = $2',
+      [req.params.id, decoded.userId]
+    );
+
+    await pool.query('COMMIT');
+    res.json({ message: 'Successfully joined bubble' });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Leave bubble
+app.post('/api/bubbles/leave', async (req, res) => {
+  try {
+    const token = req.headers.authorization.split(' ')[1];
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    await pool.query('BEGIN');
+
+    // Get current bubble_id
+    const userResult = await pool.query(
+      'SELECT current_bubble_id FROM users WHERE user_id = $1',
+      [decoded.userId]
+    );
+
+    const currentBubbleId = userResult.rows[0].current_bubble_id;
+
+    // Cancel all active requests in this bubble
+    await pool.query(`
+      UPDATE study_requests 
+      SET status = 'cancelled' 
+      WHERE requester_id = $1 
+      AND bubble_id = $2 
+      AND status IN ('open', 'matched')
+    `, [decoded.userId, currentBubbleId]);
+
+    // Cancel all active matches in this bubble
+    await pool.query(`
+      UPDATE study_matches 
+      SET status = 'cancelled' 
+      WHERE (teacher_id = $1 OR student_id = $1)
+      AND request_id IN (
+        SELECT request_id FROM study_requests 
+        WHERE bubble_id = $2
+      )
+      AND status = 'active'
+    `, [decoded.userId, currentBubbleId]);
+
+    // Remove user from bubble
+    await pool.query(
+      'UPDATE users SET current_bubble_id = NULL WHERE user_id = $1',
+      [decoded.userId]
+    );
+
+    await pool.query('COMMIT');
+    res.json({ message: 'Successfully left bubble' });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Study Requests routes
 app.post('/api/study-requests', async (req, res) => {
   try {
@@ -244,7 +317,6 @@ app.post('/api/study-requests', async (req, res) => {
   }
 });
 
-// Update in server.js
 app.delete('/api/study-requests/:id', async (req, res) => {
   try {
     const token = req.headers.authorization.split(' ')[1];
@@ -276,6 +348,120 @@ app.delete('/api/study-requests/:id', async (req, res) => {
   }
 });
 
+app.post('/api/study-requests/:id/cancel', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const token = req.headers.authorization.split(' ')[1];
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    await pool.query('BEGIN');
+
+    // First check if the request exists and belongs to the user
+    const requestCheck = await pool.query(
+      'SELECT * FROM study_requests WHERE request_id = $1 AND requester_id = $2 AND status = $3',
+      [id, decoded.userId, 'pending']
+    );
+
+    if (requestCheck.rows.length === 0) {
+      throw new Error('Request not found or cannot be cancelled');
+    }
+
+    // Delete any existing matches
+    await pool.query('DELETE FROM study_matches WHERE request_id = $1', [id]);
+
+    // Update the request status back to open
+    await pool.query(
+      'UPDATE study_requests SET status = $1 WHERE request_id = $2',
+      ['open', id]
+    );
+
+    // Get the teacher's ID to send notification
+    const matchResult = await pool.query(
+      'SELECT teacher_id FROM study_matches WHERE request_id = $1',
+      [id]
+    );
+
+    if (matchResult.rows.length > 0) {
+      // Create notification for the teacher
+      await pool.query(
+        'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
+        [
+          matchResult.rows[0].teacher_id,
+          'A study request has been cancelled by the student',
+          'request_cancelled'
+        ]
+      );
+    }
+
+    await pool.query('COMMIT');
+    res.json({ message: 'Request cancelled successfully' });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error('Error cancelling request:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/study-requests/:requestId/respond', async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const { accepted } = req.body;
+    const token = req.headers.authorization.split(' ')[1];
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    await pool.query('BEGIN');
+
+    // Verify the request exists and is pending
+    const requestResult = await pool.query(`
+      SELECT sr.*, sm.match_id, sm.teacher_id, sm.student_id
+      FROM study_requests sr
+      JOIN study_matches sm ON sr.request_id = sm.request_id
+      WHERE sr.request_id = $1 AND sr.status = 'pending'
+      AND sm.teacher_id = $2
+    `, [requestId, decoded.userId]);
+
+    if (requestResult.rows.length === 0) {
+      throw new Error('Request not found or already handled');
+    }
+
+    const request = requestResult.rows[0];
+    const newStatus = accepted ? 'active' : 'declined';
+
+    // Update request status
+    await pool.query(
+      'UPDATE study_requests SET status = $1 WHERE request_id = $2',
+      [newStatus, requestId]
+    );
+
+    // Update match status
+    await pool.query(
+      'UPDATE study_matches SET status = $1 WHERE match_id = $2',
+      [newStatus, request.match_id]
+    );
+
+    // Create notification for the student
+    await pool.query(
+      'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
+      [
+        request.student_id,
+        accepted 
+          ? 'Your study request has been accepted! You can now start learning.' 
+          : 'Your study request has been declined.',
+        accepted ? 'request_accepted' : 'request_declined'
+      ]
+    );
+
+    await pool.query('COMMIT');
+    res.json({ message: `Request ${accepted ? 'accepted' : 'declined'} successfully` });
+
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error('Error responding to request:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+//MyRequest routes
 app.get('/api/my-requests', async (req, res) => {
   try {
     const token = req.headers.authorization.split(' ')[1];
@@ -518,52 +704,6 @@ app.post('/api/matches/:id/complete', async (req, res) => {
   }
 });
 
-app.post('/api/matches/:id/complete', async (req, res) => {
-  try {
-    const { rating, comment } = req.body;
-    const token = req.headers.authorization.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    await pool.query('BEGIN');
-
-    // Update match status
-    await pool.query(
-      'UPDATE study_matches SET status = \'completed\' WHERE match_id = $1',
-      [req.params.id]
-    );
-
-    // Update request status
-    const matchResult = await pool.query(
-      'SELECT request_id, teacher_id, student_id FROM study_matches WHERE match_id = $1',
-      [req.params.id]
-    );
-
-    if (matchResult.rows.length === 0) {
-      throw new Error('Match not found');
-    }
-
-    await pool.query(
-      'UPDATE study_requests SET status = \'completed\', feedback = $1 WHERE request_id = $2',
-      [comment, matchResult.rows[0].request_id]
-    );
-
-    // Add rating
-    const match = matchResult.rows[0];
-    const ratedId = match.teacher_id === decoded.userId ? match.student_id : match.teacher_id;
-
-    await pool.query(`
-      INSERT INTO user_ratings (request_id, rater_id, rated_id, rating, comment)
-      VALUES ($1, $2, $3, $4, $5)
-    `, [match.request_id, decoded.userId, ratedId, rating, comment]);
-
-    await pool.query('COMMIT');
-    res.json({ message: 'Match completed successfully' });
-  } catch (err) {
-    await pool.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.post('/api/matches/:requestId/accept', async (req, res) => {
   try {
     const { requestId } = req.params;
@@ -629,6 +769,8 @@ app.post('/api/matches/:requestId/accept', async (req, res) => {
   }
 });
 
+
+//Notifications routes
 app.get('/api/notifications', async (req, res) => {
   try {
     const token = req.headers.authorization.split(' ')[1];
@@ -669,80 +811,7 @@ const createNotification = async (userId, message, type) => {
   }
 };
 
-// Join bubble
-app.post('/api/bubbles/:id/join', async (req, res) => {
-  try {
-    const token = req.headers.authorization.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    await pool.query('BEGIN');
-    
-    // Update user's current bubble
-    await pool.query(
-      'UPDATE users SET current_bubble_id = $1 WHERE user_id = $2',
-      [req.params.id, decoded.userId]
-    );
-
-    await pool.query('COMMIT');
-    res.json({ message: 'Successfully joined bubble' });
-  } catch (err) {
-    await pool.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Leave bubble
-// In server.js
-app.post('/api/bubbles/leave', async (req, res) => {
-  try {
-    const token = req.headers.authorization.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    await pool.query('BEGIN');
-
-    // Get current bubble_id
-    const userResult = await pool.query(
-      'SELECT current_bubble_id FROM users WHERE user_id = $1',
-      [decoded.userId]
-    );
-
-    const currentBubbleId = userResult.rows[0].current_bubble_id;
-
-    // Cancel all active requests in this bubble
-    await pool.query(`
-      UPDATE study_requests 
-      SET status = 'cancelled' 
-      WHERE requester_id = $1 
-      AND bubble_id = $2 
-      AND status IN ('open', 'matched')
-    `, [decoded.userId, currentBubbleId]);
-
-    // Cancel all active matches in this bubble
-    await pool.query(`
-      UPDATE study_matches 
-      SET status = 'cancelled' 
-      WHERE (teacher_id = $1 OR student_id = $1)
-      AND request_id IN (
-        SELECT request_id FROM study_requests 
-        WHERE bubble_id = $2
-      )
-      AND status = 'active'
-    `, [decoded.userId, currentBubbleId]);
-
-    // Remove user from bubble
-    await pool.query(
-      'UPDATE users SET current_bubble_id = NULL WHERE user_id = $1',
-      [decoded.userId]
-    );
-
-    await pool.query('COMMIT');
-    res.json({ message: 'Successfully left bubble' });
-  } catch (err) {
-    await pool.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
-  }
-});
-
+//PotentialMatches routes
 app.get('/api/potential-matches/:requestId', async (req, res) => {
   try {
     const { requestId } = req.params;
@@ -810,154 +879,6 @@ app.get('/api/potential-matches/:requestId', async (req, res) => {
     res.json(sortedMatches);
   } catch (err) {
     console.error('Matching error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Add this endpoint to your server.js
-app.post('/api/study-requests/:id/cancel', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const token = req.headers.authorization.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    await pool.query('BEGIN');
-
-    // First check if the request exists and belongs to the user
-    const requestCheck = await pool.query(
-      'SELECT * FROM study_requests WHERE request_id = $1 AND requester_id = $2 AND status = $3',
-      [id, decoded.userId, 'pending']
-    );
-
-    if (requestCheck.rows.length === 0) {
-      throw new Error('Request not found or cannot be cancelled');
-    }
-
-    // Delete any existing matches
-    await pool.query('DELETE FROM study_matches WHERE request_id = $1', [id]);
-
-    // Update the request status back to open
-    await pool.query(
-      'UPDATE study_requests SET status = $1 WHERE request_id = $2',
-      ['open', id]
-    );
-
-    // Get the teacher's ID to send notification
-    const matchResult = await pool.query(
-      'SELECT teacher_id FROM study_matches WHERE request_id = $1',
-      [id]
-    );
-
-    if (matchResult.rows.length > 0) {
-      // Create notification for the teacher
-      await pool.query(
-        'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
-        [
-          matchResult.rows[0].teacher_id,
-          'A study request has been cancelled by the student',
-          'request_cancelled'
-        ]
-      );
-    }
-
-    await pool.query('COMMIT');
-    res.json({ message: 'Request cancelled successfully' });
-  } catch (err) {
-    await pool.query('ROLLBACK');
-    console.error('Error cancelling request:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/study-requests/:requestId/respond', async (req, res) => {
-  try {
-    const { requestId } = req.params;
-    const { accepted } = req.body;
-    const token = req.headers.authorization.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    await pool.query('BEGIN');
-
-    // Verify the request exists and is pending
-    const requestResult = await pool.query(`
-      SELECT sr.*, sm.match_id, sm.teacher_id, sm.student_id
-      FROM study_requests sr
-      JOIN study_matches sm ON sr.request_id = sm.request_id
-      WHERE sr.request_id = $1 AND sr.status = 'pending'
-      AND sm.teacher_id = $2
-    `, [requestId, decoded.userId]);
-
-    if (requestResult.rows.length === 0) {
-      throw new Error('Request not found or already handled');
-    }
-
-    const request = requestResult.rows[0];
-    const newStatus = accepted ? 'active' : 'declined';
-
-    // Update request status
-    await pool.query(
-      'UPDATE study_requests SET status = $1 WHERE request_id = $2',
-      [newStatus, requestId]
-    );
-
-    // Update match status
-    await pool.query(
-      'UPDATE study_matches SET status = $1 WHERE match_id = $2',
-      [newStatus, request.match_id]
-    );
-
-    // Create notification for the student
-    await pool.query(
-      'INSERT INTO notifications (user_id, message, type) VALUES ($1, $2, $3)',
-      [
-        request.student_id,
-        accepted 
-          ? 'Your study request has been accepted! You can now start learning.' 
-          : 'Your study request has been declined.',
-        accepted ? 'request_accepted' : 'request_declined'
-      ]
-    );
-
-    await pool.query('COMMIT');
-    res.json({ message: `Request ${accepted ? 'accepted' : 'declined'} successfully` });
-
-  } catch (err) {
-    await pool.query('ROLLBACK');
-    console.error('Error responding to request:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete('/api/study-requests/:id', async (req, res) => {
-  try {
-    const token = req.headers.authorization.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    await pool.query('BEGIN');
-
-    // Get the request details first
-    const requestResult = await pool.query(
-      'SELECT * FROM study_requests WHERE request_id = $1 AND requester_id = $2',
-      [req.params.id, decoded.userId]
-    );
-
-    if (requestResult.rows.length === 0) {
-      throw new Error('Request not found or unauthorized');
-    }
-
-    // Delete any matches
-    await pool.query('DELETE FROM study_matches WHERE request_id = $1', [req.params.id]);
-
-    // Update the request status back to 'open' instead of deleting
-    await pool.query(
-      'UPDATE study_requests SET status = $1 WHERE request_id = $2',
-      ['open', req.params.id]
-    );
-
-    await pool.query('COMMIT');
-    res.json({ message: 'Request cancelled successfully' });
-  } catch (err) {
-    await pool.query('ROLLBACK');
     res.status(500).json({ error: err.message });
   }
 });

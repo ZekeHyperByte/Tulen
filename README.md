@@ -9,7 +9,7 @@
 
 ### Database Setup
 1. Install PostgreSQL
-2. Create a database named `[your_database_name]`
+2. Create a database named `tulen_db`
 3. Run the SQL schema provided in `database/schema.sql`
 
 ### Backend Setup
